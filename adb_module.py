@@ -2,29 +2,32 @@ import subprocess
 import threading
 import time
 import logging
-import socket
 import requests
 import cv2
 import numpy as np
+from flask import Flask, Response
 
 # ==== CONFIGURATION ====
 ADB_PORT = 9999
 LOCAL_PORT = 9999
-UDP_IP = "127.0.0.1"
-UDP_PORT = 5454
-CAPTURE_URL = f"http://127.0.0.1:9998/capture"
+CAPTURE_URL = "http://127.0.0.1:9998/capture"
+HTTP_STREAM_PORT = 9995
+HTTP_STREAM_PATH = "/mjpg/video.mjpg"
 FPS = 30
-CHUNK_SIZE = 1300
 
 # ==== LOGGER SETUP ====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+app = Flask(__name__)
+frame_lock = threading.Lock()
+latest_frame = None
+
 
 class ADBManager:
     def __init__(self):
         self.running = False
         self.thread = None
         self.device_was_connected = False
-        self.udp_clients = set()
         self.restream_thread = None
         self.restream_active = False
 
@@ -45,48 +48,40 @@ class ADBManager:
         logging.info("ADB server restarted")
 
     def mjpeg_reader(self, url):
-        try:
-            stream = requests.get(url, stream=True, timeout=3)
-            buffer = b''
-            for chunk in stream.iter_content(1024):
-                buffer += chunk
-                a = buffer.find(b'\xff\xd8')
-                b = buffer.find(b'\xff\xd9')
-                if a != -1 and b != -1:
-                    jpg = buffer[a:b+2]
-                    buffer = buffer[b+2:]
-                    img = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if img is not None:
-                        yield img
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Error reading MJPEG stream: {e}")
+        while self.restream_active:
+            try:
+                stream = requests.get(url, stream=True, timeout=3)
+                buffer = b''
+                for chunk in stream.iter_content(1024):
+                    if not self.restream_active:
+                        break
+                    buffer += chunk
+                    a = buffer.find(b'\xff\xd8')
+                    b = buffer.find(b'\xff\xd9')
+                    if a != -1 and b != -1:
+                        jpg = buffer[a:b+2]
+                        buffer = buffer[b+2:]
+                        img = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if img is not None:
+                            global latest_frame
+                            with frame_lock:
+                                latest_frame = img
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Error reading MJPEG stream: {e}")
+                time.sleep(2)
 
-    def restream_udp(self):
-        logging.info("Starting UDP restreamer...")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        for frame in self.mjpeg_reader(CAPTURE_URL):
-            if not self.restream_active:
-                break
-            _, jpeg = cv2.imencode('.jpg', frame)
-            data = jpeg.tobytes()
-            for i in range(0, len(data), CHUNK_SIZE):
-                chunk = data[i:i+CHUNK_SIZE]
-                sock.sendto(chunk, (UDP_IP, UDP_PORT))
-            time.sleep(1 / FPS)
-        sock.close()
-        logging.info("Stopped UDP restreamer.")
+    def restream_http(self):
+        logging.info(f"Starting HTTP MJPEG server on http://127.0.0.1:{HTTP_STREAM_PORT}{HTTP_STREAM_PATH}")
+        app.run(host="0.0.0.0", port=HTTP_STREAM_PORT, threaded=True)
 
     def start_restreaming(self):
         if not self.restream_active:
             self.restream_active = True
-            self.restream_thread = threading.Thread(target=self.restream_udp, daemon=True)
-            self.restream_thread.start()
+            threading.Thread(target=self.mjpeg_reader, args=(CAPTURE_URL,), daemon=True).start()
+            threading.Thread(target=self.restream_http, daemon=True).start()
 
     def stop_restreaming(self):
-        if self.restream_active:
-            self.restream_active = False
-            if self.restream_thread:
-                self.restream_thread.join()
+        self.restream_active = False
 
     def monitor_loop(self):
         logging.info("ADB monitor loop started.")
@@ -118,3 +113,18 @@ class ADBManager:
         if self.thread:
             self.thread.join()
         logging.info("ADB Manager stopped.")
+
+
+@app.route(HTTP_STREAM_PATH)
+def mjpeg_feed():
+    def generate():
+        while True:
+            with frame_lock:
+                frame = latest_frame.copy() if latest_frame is not None else None
+            if frame is not None:
+                _, jpeg = cv2.imencode('.jpg', frame)
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            time.sleep(1 / FPS)
+
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
